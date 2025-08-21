@@ -91,13 +91,6 @@ by Pengu
    python crackgpt.py
    ```
 
-   On startup it prints:
-
-   ```
-   CrackGPT
-   by Pengu
-   ```
-
 ## Usage in Discord
 
 - Chat as normal; the bot replies in allowed channels.
