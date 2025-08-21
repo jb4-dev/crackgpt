@@ -78,7 +78,6 @@ by Pengu
    SPOTIFY_CLIENT_SECRET=
 
    # Prompting
-   MASTER_INSTRUCTION=You are CrackGPT, a witty but helpful Discord participant. Be concise...
    TOGGLE_KEYWORD=!crackgpt toggle
 
    # Logging
