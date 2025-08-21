@@ -3,24 +3,27 @@
 CrackGPT - Discord bot powered by a local Ollama model with optional
 website enrichment and Spotify track context.
 
-Single-file, production-ready, easy to modify with built-in configuration.
+Single-file, production-ready, easy to modify.
 ©2025 Pengu
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import os
 import random
 import re
 import signal
 import sys
+import textwrap
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 # Third-party deps
-# pip install discord aiohttp beautifulsoup4 ollama spotipy
+# pip install discord aiohttp beautifulsoup4 ollama spotipy python-dotenv
 import aiohttp
 import discord
 from bs4 import BeautifulSoup
@@ -56,8 +59,37 @@ def print_banner() -> None:
 
 
 # ====================
-# Built-in Configuration
+# Configuration
 # ====================
+
+def getenv_bool(key: str, default: bool) -> bool:
+    v = os.getenv(key)
+    if v is None:
+        return default
+    return v.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+def getenv_int(key: str, default: int) -> int:
+    v = os.getenv(key)
+    if v is None:
+        return default
+    try:
+        return int(v)
+    except ValueError:
+        return default
+
+def getenv_list(key: str, default: List[int] | List[str]) -> List[Any]:
+    v = os.getenv(key)
+    if v is None or not v.strip():
+        return default
+    parts = [p.strip() for p in v.split(",")]
+    # try ints, else strings
+    out: List[Any] = []
+    for p in parts:
+        try:
+            out.append(int(p))
+        except ValueError:
+            out.append(p)
+    return out
 
 DEFAULT_MASTER_INSTRUCTION = """\
 You are CrackGPT, a witty but helpful Discord participant. Be concise, on-topic,
@@ -68,56 +100,50 @@ friendly, safe, and useful.
 
 @dataclass(slots=True)
 class Config:
-    # ==========================================
-    # REQUIRED CONFIGURATION - MODIFY THESE
-    # ==========================================
-    
-    # Discord Bot Token (REQUIRED)
-    discord_token: str = "YOUR_DISCORD_BOT_TOKEN_HERE"
-    
-    # Ollama Model Configuration
-    ollama_model: str = "llama3"
-    ollama_timeout_sec: int = 60
-    
-    # Spotify Configuration (Optional - leave empty to disable)
-    spotify_client_id: str = ""
-    spotify_client_secret: str = ""
-    
-    # ==========================================
-    # OPTIONAL CONFIGURATION
-    # ==========================================
-    
-    # Feature Toggles
-    enable_web_scraping: bool = True
-    enable_spotify: bool = True
-    respond_to_bots: bool = False
-    
-    # Channel Restrictions (empty list = respond in all channels)
-    # Example: [123456789012345678, 987654321098765432]
-    allowed_channels: List[int] = field(default_factory=list)
-    
-    # Conversation History
-    max_history_turns: int = 12
-    
-    # Random Chatter Configuration
-    random_message_enabled: bool = False
-    random_interval_min_s: int = 900   # 15 minutes
-    random_interval_max_s: int = 1800  # 30 minutes
-    
-    # Web Scraping Configuration
-    user_agent: str = (
+    # Required
+    discord_token: str = os.getenv("DISCORD_BOT_TOKEN", "").strip()
+
+    # Model
+    ollama_model: str = os.getenv("OLLAMA_MODEL", "llama3")
+    ollama_timeout_sec: int = getenv_int("OLLAMA_TIMEOUT_SEC", 60)
+
+    # Behavior / Features
+    enable_web_scraping: bool = getenv_bool("ENABLE_WEB_SCRAPING", True)
+    enable_spotify: bool = getenv_bool("ENABLE_SPOTIFY_FEATURES", True)
+    max_history_turns: int = getenv_int("HISTORY_MAX_TURNS", 12)
+    respond_to_bots: bool = getenv_bool("RESPOND_TO_BOTS", False)
+
+    # Allowed channels (empty => respond everywhere)
+    allowed_channels: List[int] = field(
+        default_factory=lambda: getenv_list("ALLOWED_CHANNELS", [])
+    )
+
+    # Random chatter
+    random_message_enabled: bool = getenv_bool("RANDOM_MESSAGE_ENABLED", False)
+    random_interval_min_s: int = getenv_int("RANDOM_INTERVAL_MIN_S", 900)  # 15 min
+    random_interval_max_s: int = getenv_int("RANDOM_INTERVAL_MAX_S", 1800) # 30 min
+
+    # Scraping
+    user_agent: str = os.getenv(
+        "USER_AGENT",
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     )
-    max_content_chars: int = 2000
-    http_total_timeout: int = 10
-    
-    # Bot Behavior
-    master_instruction: str = DEFAULT_MASTER_INSTRUCTION
-    toggle_keyword: str = "!crackgpt toggle"
-    
-    # Logging Level (DEBUG, INFO, WARNING, ERROR)
-    log_level: str = "INFO"
+    max_content_chars: int = getenv_int("MAX_CONTENT_LENGTH", 2000)
+    http_total_timeout: int = getenv_int("HTTP_TOTAL_TIMEOUT", 10)
+
+    # Spotify (optional)
+    spotify_client_id: str = os.getenv("SPOTIFY_CLIENT_ID", "")
+    spotify_client_secret: str = os.getenv("SPOTIFY_CLIENT_SECRET", "")
+
+    # Prompting
+    master_instruction: str = os.getenv("MASTER_INSTRUCTION", DEFAULT_MASTER_INSTRUCTION)
+
+    # Toggle helper keyword
+    toggle_keyword: str = os.getenv("TOGGLE_KEYWORD", "!crackgpt toggle")
+
+    # Logging
+    log_level: str = os.getenv("LOG_LEVEL", "INFO")
 
 
 # ====================
@@ -241,6 +267,7 @@ class ChannelState:
     history: Deque[Dict[str, str]] = field(default_factory=lambda: deque(maxlen=24))
     toggle_on: bool = True  # per-channel master instruction toggle
     active: bool = False    # seen messages recently
+    bot_messages: set = field(default_factory=set)  # Track bot's own message IDs
 
 
 class State:
@@ -262,6 +289,14 @@ class State:
 
     def mark_active(self, channel_id: int) -> None:
         self.channels[channel_id].active = True
+
+    def add_bot_message(self, channel_id: int, message_id: int) -> None:
+        """Track a message ID as sent by the bot"""
+        self.channels[channel_id].bot_messages.add(message_id)
+
+    def is_bot_message(self, channel_id: int, message_id: int) -> bool:
+        """Check if a message ID was sent by the bot"""
+        return message_id in self.channels[channel_id].bot_messages
 
 
 # ====================
@@ -304,14 +339,30 @@ class CrackGPTBot(discord.Client):
     async def close(self) -> None:
         if self._random_task:
             self._random_task.cancel()
-            try:
+            with contextlib.suppress(Exception):
                 await self._random_task
-            except Exception:
-                pass
         await super().close()
 
     async def on_ready(self) -> None:
         self.log.info("Logged in as %s (id=%s)", self.user, self.user and self.user.id)
+
+    def should_respond_to_message(self, message: discord.Message) -> bool:
+        """Check if the bot should respond to this message"""
+        # Always respond to commands
+        if message.content.strip().lower().startswith((self.cfg.toggle_keyword.lower(), "!crackgpt help", "!cg help", "!help cg")):
+            return True
+
+        # Check if bot was mentioned
+        if self.user and self.user.mentioned_in(message):
+            return True
+
+        # Check if this is a reply to one of the bot's messages
+        if message.reference and message.reference.message_id:
+            channel_id = message.channel.id
+            if self.state.is_bot_message(channel_id, message.reference.message_id):
+                return True
+
+        return False
 
     async def on_message(self, message: discord.Message) -> None:
         # Basic filters
@@ -326,7 +377,7 @@ class CrackGPTBot(discord.Client):
 
         content = message.content.strip()
 
-        # Commands
+        # Commands (always respond to these)
         if content.lower().startswith(self.cfg.toggle_keyword.lower()):
             new_state = self.state.toggle(channel_id)
             await message.channel.send(f"CrackGPT style toggle is now **{'ON' if new_state else 'OFF'}** for this channel.")
@@ -337,7 +388,12 @@ class CrackGPTBot(discord.Client):
                 "Commands:\n"
                 f"- `{self.cfg.toggle_keyword}` — toggle style guidance for this channel\n"
                 "- `!crackgpt help` — show this help\n"
+                "- Mention me or reply to my messages to chat!\n"
             )
+            return
+
+        # Check if we should respond to this message
+        if not self.should_respond_to_message(message):
             return
 
         # Mark channel as active for random chatter eligibility
@@ -346,11 +402,16 @@ class CrackGPTBot(discord.Client):
         # Build history and enrichment
         history = self.state.get_history(channel_id)
 
+        # Clean content by removing bot mentions for a cleaner prompt
+        clean_content = content
+        if self.user:
+            clean_content = re.sub(f'<@!?{self.user.id}>', '', clean_content).strip()
+
         # 1) Save user message (include display name for better style learning)
-        history.append({"role": "user", "content": f"{message.author.display_name}: {content}"})
+        history.append({"role": "user", "content": f"{message.author.display_name}: {clean_content}"})
 
         # 2) Enrichment: URLs + Spotify
-        urls = extract_urls(content)
+        urls = extract_urls(clean_content)
         enrich_lines: List[str] = []
         async with aiohttp.ClientSession() as session:
             for url in urls:
@@ -408,7 +469,10 @@ class CrackGPTBot(discord.Client):
         # 6) Save assistant reply and send
         history.append({"role": "assistant", "content": reply})
         try:
-            await message.channel.send(reply)
+            sent_message = await message.channel.send(reply)
+            # Track this message as sent by the bot
+            if sent_message:
+                self.state.add_bot_message(channel_id, sent_message.id)
         except Exception as e:  # pragma: no cover
             self.log.warning("Failed to send message: %s", e)
 
@@ -450,7 +514,10 @@ class CrackGPTBot(discord.Client):
                 if not random_msg:
                     continue
                 history.append({"role": "assistant", "content": random_msg})
-                await channel.send(random_msg)
+                sent_message = await channel.send(random_msg)
+                # Track this message as sent by the bot
+                if sent_message:
+                    self.state.add_bot_message(channel_id, sent_message.id)
             except Exception as e:  # pragma: no cover
                 self.log.debug("Random chatter skipped due to error: %s", e)
 
@@ -460,9 +527,8 @@ class CrackGPTBot(discord.Client):
 # ====================
 
 async def amain(cfg: Config) -> int:
-    if cfg.discord_token == "YOUR_DISCORD_BOT_TOKEN_HERE" or not cfg.discord_token:
-        print("ERROR: Please set your Discord bot token in the Config class.")
-        print("Edit the 'discord_token' field in the Config dataclass with your actual bot token.")
+    if not cfg.discord_token:
+        print("ERROR: DISCORD_BOT_TOKEN is not set.")
         return 2
 
     setup_logging(cfg.log_level)
@@ -479,16 +545,12 @@ async def amain(cfg: Config) -> int:
     stop_event = asyncio.Event()
 
     def _signal_handler():
-        try:
+        with contextlib.suppress(Exception):
             stop_event.set()
-        except Exception:
-            pass
 
     for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
+        with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(sig, _signal_handler)
-        except NotImplementedError:
-            pass
 
     async def _runner():
         try:
@@ -507,6 +569,14 @@ async def amain(cfg: Config) -> int:
     return await runner
 
 def main() -> None:
+    # Allow .env without adding a dependency if present
+    if os.path.exists(".env"):
+        try:
+            from dotenv import load_dotenv  # type: ignore
+            load_dotenv()
+        except Exception:
+            pass
+
     cfg = Config()
     try:
         code = asyncio.run(amain(cfg))
