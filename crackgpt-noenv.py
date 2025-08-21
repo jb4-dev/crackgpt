@@ -3,27 +3,24 @@
 CrackGPT - Discord bot powered by a local Ollama model with optional
 website enrichment and Spotify track context.
 
-Single-file, production-ready, easy to modify.
+Single-file, production-ready, easy to modify with built-in configuration.
 ©2025 Pengu
 """
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
-import os
 import random
 import re
 import signal
 import sys
-import textwrap
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional
 
 # Third-party deps
-# pip install discord aiohttp beautifulsoup4 ollama spotipy python-dotenv
+# pip install discord aiohttp beautifulsoup4 ollama spotipy
 import aiohttp
 import discord
 from bs4 import BeautifulSoup
@@ -59,37 +56,8 @@ def print_banner() -> None:
 
 
 # ====================
-# Configuration
+# Built-in Configuration
 # ====================
-
-def getenv_bool(key: str, default: bool) -> bool:
-    v = os.getenv(key)
-    if v is None:
-        return default
-    return v.strip().lower() in {"1", "true", "yes", "y", "on"}
-
-def getenv_int(key: str, default: int) -> int:
-    v = os.getenv(key)
-    if v is None:
-        return default
-    try:
-        return int(v)
-    except ValueError:
-        return default
-
-def getenv_list(key: str, default: List[int] | List[str]) -> List[Any]:
-    v = os.getenv(key)
-    if v is None or not v.strip():
-        return default
-    parts = [p.strip() for p in v.split(",")]
-    # try ints, else strings
-    out: List[Any] = []
-    for p in parts:
-        try:
-            out.append(int(p))
-        except ValueError:
-            out.append(p)
-    return out
 
 DEFAULT_MASTER_INSTRUCTION = """\
 You are CrackGPT, a witty but helpful Discord participant. Be concise, on-topic,
@@ -100,50 +68,56 @@ friendly, safe, and useful.
 
 @dataclass(slots=True)
 class Config:
-    # Required
-    discord_token: str = os.getenv("DISCORD_BOT_TOKEN", "").strip()
-
-    # Model
-    ollama_model: str = os.getenv("OLLAMA_MODEL", "llama3")
-    ollama_timeout_sec: int = getenv_int("OLLAMA_TIMEOUT_SEC", 60)
-
-    # Behavior / Features
-    enable_web_scraping: bool = getenv_bool("ENABLE_WEB_SCRAPING", True)
-    enable_spotify: bool = getenv_bool("ENABLE_SPOTIFY_FEATURES", True)
-    max_history_turns: int = getenv_int("HISTORY_MAX_TURNS", 12)
-    respond_to_bots: bool = getenv_bool("RESPOND_TO_BOTS", False)
-
-    # Allowed channels (empty => respond everywhere)
-    allowed_channels: List[int] = field(
-        default_factory=lambda: getenv_list("ALLOWED_CHANNELS", [])
-    )
-
-    # Random chatter
-    random_message_enabled: bool = getenv_bool("RANDOM_MESSAGE_ENABLED", False)
-    random_interval_min_s: int = getenv_int("RANDOM_INTERVAL_MIN_S", 900)  # 15 min
-    random_interval_max_s: int = getenv_int("RANDOM_INTERVAL_MAX_S", 1800) # 30 min
-
-    # Scraping
-    user_agent: str = os.getenv(
-        "USER_AGENT",
+    # ==========================================
+    # REQUIRED CONFIGURATION - MODIFY THESE
+    # ==========================================
+    
+    # Discord Bot Token (REQUIRED)
+    discord_token: str = "YOUR_DISCORD_BOT_TOKEN_HERE"
+    
+    # Ollama Model Configuration
+    ollama_model: str = "llama3"
+    ollama_timeout_sec: int = 60
+    
+    # Spotify Configuration (Optional - leave empty to disable)
+    spotify_client_id: str = ""
+    spotify_client_secret: str = ""
+    
+    # ==========================================
+    # OPTIONAL CONFIGURATION
+    # ==========================================
+    
+    # Feature Toggles
+    enable_web_scraping: bool = True
+    enable_spotify: bool = True
+    respond_to_bots: bool = False
+    
+    # Channel Restrictions (empty list = respond in all channels)
+    # Example: [123456789012345678, 987654321098765432]
+    allowed_channels: List[int] = field(default_factory=list)
+    
+    # Conversation History
+    max_history_turns: int = 12
+    
+    # Random Chatter Configuration
+    random_message_enabled: bool = False
+    random_interval_min_s: int = 900   # 15 minutes
+    random_interval_max_s: int = 1800  # 30 minutes
+    
+    # Web Scraping Configuration
+    user_agent: str = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     )
-    max_content_chars: int = getenv_int("MAX_CONTENT_LENGTH", 2000)
-    http_total_timeout: int = getenv_int("HTTP_TOTAL_TIMEOUT", 10)
-
-    # Spotify (optional)
-    spotify_client_id: str = os.getenv("SPOTIFY_CLIENT_ID", "")
-    spotify_client_secret: str = os.getenv("SPOTIFY_CLIENT_SECRET", "")
-
-    # Prompting
-    master_instruction: str = os.getenv("MASTER_INSTRUCTION", DEFAULT_MASTER_INSTRUCTION)
-
-    # Toggle helper keyword
-    toggle_keyword: str = os.getenv("TOGGLE_KEYWORD", "!crackgpt toggle")
-
-    # Logging
-    log_level: str = os.getenv("LOG_LEVEL", "INFO")
+    max_content_chars: int = 2000
+    http_total_timeout: int = 10
+    
+    # Bot Behavior
+    master_instruction: str = DEFAULT_MASTER_INSTRUCTION
+    toggle_keyword: str = "!crackgpt toggle"
+    
+    # Logging Level (DEBUG, INFO, WARNING, ERROR)
+    log_level: str = "INFO"
 
 
 # ====================
@@ -339,8 +313,10 @@ class CrackGPTBot(discord.Client):
     async def close(self) -> None:
         if self._random_task:
             self._random_task.cancel()
-            with contextlib.suppress(Exception):
+            try:
                 await self._random_task
+            except Exception:
+                pass
         await super().close()
 
     async def on_ready(self) -> None:
@@ -527,8 +503,9 @@ class CrackGPTBot(discord.Client):
 # ====================
 
 async def amain(cfg: Config) -> int:
-    if not cfg.discord_token:
-        print("ERROR: DISCORD_BOT_TOKEN is not set.")
+    if cfg.discord_token == "YOUR_DISCORD_BOT_TOKEN_HERE" or not cfg.discord_token:
+        print("ERROR: Please set your Discord bot token in the Config class.")
+        print("Edit the 'discord_token' field in the Config dataclass with your actual bot token.")
         return 2
 
     setup_logging(cfg.log_level)
@@ -545,12 +522,16 @@ async def amain(cfg: Config) -> int:
     stop_event = asyncio.Event()
 
     def _signal_handler():
-        with contextlib.suppress(Exception):
+        try:
             stop_event.set()
+        except Exception:
+            pass
 
     for sig in (signal.SIGINT, signal.SIGTERM):
-        with contextlib.suppress(NotImplementedError):
+        try:
             loop.add_signal_handler(sig, _signal_handler)
+        except NotImplementedError:
+            pass
 
     async def _runner():
         try:
@@ -569,14 +550,6 @@ async def amain(cfg: Config) -> int:
     return await runner
 
 def main() -> None:
-    # Allow .env without adding a dependency if present
-    if os.path.exists(".env"):
-        try:
-            from dotenv import load_dotenv  # type: ignore
-            load_dotenv()
-        except Exception:
-            pass
-
     cfg = Config()
     try:
         code = asyncio.run(amain(cfg))
