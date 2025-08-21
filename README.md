@@ -1,4 +1,4 @@
-# CrackGPT (by Pengu)
+# CrackGPT
 
 A single-file Discord bot that chats using a local **Ollama** model and can
 optionally enrich replies with **website previews** and **Spotify track** details.
