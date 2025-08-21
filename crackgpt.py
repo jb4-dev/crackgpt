@@ -10,6 +10,7 @@ Single-file, production-ready, easy to modify.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import random
@@ -266,6 +267,7 @@ class ChannelState:
     history: Deque[Dict[str, str]] = field(default_factory=lambda: deque(maxlen=24))
     toggle_on: bool = True  # per-channel master instruction toggle
     active: bool = False    # seen messages recently
+    bot_messages: set = field(default_factory=set)  # Track bot's own message IDs
 
 
 class State:
@@ -287,6 +289,14 @@ class State:
 
     def mark_active(self, channel_id: int) -> None:
         self.channels[channel_id].active = True
+
+    def add_bot_message(self, channel_id: int, message_id: int) -> None:
+        """Track a message ID as sent by the bot"""
+        self.channels[channel_id].bot_messages.add(message_id)
+
+    def is_bot_message(self, channel_id: int, message_id: int) -> bool:
+        """Check if a message ID was sent by the bot"""
+        return message_id in self.channels[channel_id].bot_messages
 
 
 # ====================
@@ -336,6 +346,24 @@ class CrackGPTBot(discord.Client):
     async def on_ready(self) -> None:
         self.log.info("Logged in as %s (id=%s)", self.user, self.user and self.user.id)
 
+    def should_respond_to_message(self, message: discord.Message) -> bool:
+        """Check if the bot should respond to this message"""
+        # Always respond to commands
+        if message.content.strip().lower().startswith((self.cfg.toggle_keyword.lower(), "!crackgpt help", "!cg help", "!help cg")):
+            return True
+
+        # Check if bot was mentioned
+        if self.user and self.user.mentioned_in(message):
+            return True
+
+        # Check if this is a reply to one of the bot's messages
+        if message.reference and message.reference.message_id:
+            channel_id = message.channel.id
+            if self.state.is_bot_message(channel_id, message.reference.message_id):
+                return True
+
+        return False
+
     async def on_message(self, message: discord.Message) -> None:
         # Basic filters
         if not message.content:
@@ -349,7 +377,7 @@ class CrackGPTBot(discord.Client):
 
         content = message.content.strip()
 
-        # Commands
+        # Commands (always respond to these)
         if content.lower().startswith(self.cfg.toggle_keyword.lower()):
             new_state = self.state.toggle(channel_id)
             await message.channel.send(f"CrackGPT style toggle is now **{'ON' if new_state else 'OFF'}** for this channel.")
@@ -360,7 +388,12 @@ class CrackGPTBot(discord.Client):
                 "Commands:\n"
                 f"- `{self.cfg.toggle_keyword}` — toggle style guidance for this channel\n"
                 "- `!crackgpt help` — show this help\n"
+                "- Mention me or reply to my messages to chat!\n"
             )
+            return
+
+        # Check if we should respond to this message
+        if not self.should_respond_to_message(message):
             return
 
         # Mark channel as active for random chatter eligibility
@@ -369,11 +402,16 @@ class CrackGPTBot(discord.Client):
         # Build history and enrichment
         history = self.state.get_history(channel_id)
 
+        # Clean content by removing bot mentions for a cleaner prompt
+        clean_content = content
+        if self.user:
+            clean_content = re.sub(f'<@!?{self.user.id}>', '', clean_content).strip()
+
         # 1) Save user message (include display name for better style learning)
-        history.append({"role": "user", "content": f"{message.author.display_name}: {content}"})
+        history.append({"role": "user", "content": f"{message.author.display_name}: {clean_content}"})
 
         # 2) Enrichment: URLs + Spotify
-        urls = extract_urls(content)
+        urls = extract_urls(clean_content)
         enrich_lines: List[str] = []
         async with aiohttp.ClientSession() as session:
             for url in urls:
@@ -431,7 +469,10 @@ class CrackGPTBot(discord.Client):
         # 6) Save assistant reply and send
         history.append({"role": "assistant", "content": reply})
         try:
-            await message.channel.send(reply)
+            sent_message = await message.channel.send(reply)
+            # Track this message as sent by the bot
+            if sent_message:
+                self.state.add_bot_message(channel_id, sent_message.id)
         except Exception as e:  # pragma: no cover
             self.log.warning("Failed to send message: %s", e)
 
@@ -473,7 +514,10 @@ class CrackGPTBot(discord.Client):
                 if not random_msg:
                     continue
                 history.append({"role": "assistant", "content": random_msg})
-                await channel.send(random_msg)
+                sent_message = await channel.send(random_msg)
+                # Track this message as sent by the bot
+                if sent_message:
+                    self.state.add_bot_message(channel_id, sent_message.id)
             except Exception as e:  # pragma: no cover
                 self.log.debug("Random chatter skipped due to error: %s", e)
 
@@ -481,8 +525,6 @@ class CrackGPTBot(discord.Client):
 # ====================
 # Main
 # ====================
-
-import contextlib
 
 async def amain(cfg: Config) -> int:
     if not cfg.discord_token:
