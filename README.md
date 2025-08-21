@@ -113,6 +113,10 @@ Open `crackgpt.py` and edit:
 - Handles **graceful shutdown** on SIGINT/SIGTERM.
 - Keeps a rolling **per-channel history** (bounded by `HISTORY_MAX_TURNS`).
 
+## Note on the Non-Env version
+
+If using the .env file is troubling, there is a version that uses local variables available.
+
 ## FAQ
 
 **Q: Does it need Spotify?**  
@@ -123,6 +127,7 @@ A: Yes—this repo is designed as a single `crackgpt.py` file. The `.env` file i
 
 **Q: Can it run without web scraping?**  
 A: Yes—set `ENABLE_WEB_SCRAPING=false`.
+
 
 ---
 
